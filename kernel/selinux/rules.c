@@ -51,6 +51,12 @@ void apply_kernelsu_rules()
         pr_info("SELinux permissive or disabled, apply rules!\n");
     }
 
+    /* No policy loaded yet; ksu_dup_sepolicy() would oops on the NULL policy. */
+    if (!old_pol) {
+        pr_warn("SELinux policy not loaded, skip KSU rule application\n");
+        return;
+    }
+
     mutex_lock(&selinux_state.policy_mutex);
     backup_sepolicy =
         ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
