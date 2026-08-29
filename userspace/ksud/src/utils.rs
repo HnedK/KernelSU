@@ -1,7 +1,8 @@
 use anyhow::{Context, Error, Ok, Result, bail};
-use rustix::fs::{Mode, OFlags, open};
+use rustix::fs::{Mode, OFlags, chown, open};
 use rustix::process::setpgid;
 use rustix::stdio::{dup2_stderr, dup2_stdin, dup2_stdout};
+use rustix::thread::{Gid, Uid};
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     fs::{File, OpenOptions, create_dir_all, remove_file, write},
@@ -231,6 +232,46 @@ fn link_ksud_to_bin() -> Result<()> {
     Ok(())
 }
 
+pub fn stage_daemon_from(staged_exe: impl AsRef<Path>) -> Result<()> {
+    ensure_dir_exists(defs::ADB_DIR)?;
+
+    std::fs::rename(staged_exe.as_ref(), defs::DAEMON_PATH).with_context(|| {
+        format!(
+            "Failed to rename {} to {}",
+            staged_exe.as_ref().display(),
+            defs::DAEMON_PATH
+        )
+    })?;
+    chown(defs::DAEMON_PATH, Some(Uid::ROOT), Some(Gid::ROOT))?;
+    #[cfg(unix)]
+    set_permissions(defs::DAEMON_PATH, Permissions::from_mode(0o755))?;
+
+    Ok(())
+}
+
+/// Finish the remaining install steps without rewriting DAEMON_PATH.
+///
+/// Samsung late-load: the daemon is already staged (see `stage_daemon_from`)
+/// before the module load. Writing /data/adb/ksud *after* the module changed
+/// the loader's security context fails under Samsung KDP/SELinux (the
+/// destination would remain a zero-byte file), so the daemon copy must not
+/// run here.
+pub fn finish_install(libadbroot: Option<PathBuf>) -> Result<()> {
+    restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::KSU_CON)?;
+    // install binary assets
+    assets::ensure_binaries(false).with_context(|| "Failed to extract assets")?;
+
+    link_ksud_to_bin()?;
+
+    if let Some(libadbroot) = libadbroot {
+        ensure_dir_exists(defs::LIBRARY_DIR)?;
+        let _ = std::fs::remove_file(defs::LIBADBROOT_PATH);
+        let _ = std::fs::copy(libadbroot, defs::LIBADBROOT_PATH);
+    }
+
+    Ok(())
+}
+
 pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Result<()> {
     ensure_dir_exists(defs::ADB_DIR)?;
     let _ = std::fs::remove_file(defs::DAEMON_PATH);
@@ -319,10 +360,6 @@ pub fn daemonize_with<F: FnOnce() -> Result<()>>(use_init_pgrp: bool, configure:
         unsafe { libc::_exit(0) }
     }
     Ok(())
-}
-
-pub fn daemonize(use_init_pgrp: bool) -> Result<()> {
-    daemonize_with(use_init_pgrp, || Ok(()))
 }
 
 pub fn create_daemon(use_init_pgrp: bool) -> Result<bool> {
