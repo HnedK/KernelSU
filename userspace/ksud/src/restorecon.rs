@@ -13,12 +13,23 @@ pub const UNLABEL_CON: &str = "u:object_r:unlabeled:s0";
 const SELINUX_XATTR: &str = "security.selinux";
 
 pub fn lsetfilecon<P: AsRef<Path>>(path: P, con: &str) -> Result<()> {
-    lsetxattr(&path, SELINUX_XATTR, con, XattrFlags::empty()).with_context(|| {
-        format!(
-            "Failed to change SELinux context for {}",
-            path.as_ref().display()
-        )
-    })?;
+    if let Err(e) = lsetxattr(&path, SELINUX_XATTR, con, XattrFlags::empty()) {
+        let raw = e.0; /* errno::Errno(pub i32) */
+        if raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP {
+            /* SELinux xattrs unsupported here; nothing to restore. */
+            log::warn!(
+                "skip SELinux xattr for {}: xattr unsupported",
+                path.as_ref().display()
+            );
+            return Ok(());
+        }
+        return Err(e).with_context(|| {
+            format!(
+                "Failed to change SELinux context for {}",
+                path.as_ref().display()
+            )
+        });
+    }
     Ok(())
 }
 

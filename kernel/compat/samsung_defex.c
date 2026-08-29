@@ -18,12 +18,16 @@ static defex_get_task_creds_t defex_get_task_creds;
 static defex_set_task_creds_t defex_set_task_creds;
 static bool defex_enforce_hooked;
 
+/* The module loader (ksud) is DEFEX-visible before it enters the KSU domain. */
+static struct task_struct *ksu_trusted_task;
+
 static int ksu_samsung_defex_pre_handler(struct kprobe *probe, struct pt_regs *regs)
 {
     struct task_struct *task = (struct task_struct *)regs->regs[0];
 
     (void)probe;
-    if (task == current && current_uid().val == 0 && is_ksu_domain())
+    if (task == ksu_trusted_task ||
+        (task == current && current_uid().val == 0 && is_ksu_domain()))
         regs->regs[0] = 0;
 
     return 0;
@@ -39,6 +43,8 @@ int ksu_samsung_defex_init(void)
 {
 #ifdef CONFIG_KSU_SAMSUNG_DEFEX
     int ret;
+
+    ksu_trusted_task = current;
 
     defex_get_task_creds = (defex_get_task_creds_t)ksu_resolve_symbol_for_functable_hook("get_task_creds");
     defex_set_task_creds = (defex_set_task_creds_t)ksu_resolve_symbol_for_functable_hook("set_task_creds");
@@ -66,6 +72,7 @@ void ksu_samsung_defex_exit(void)
         unregister_kprobe(&defex_enforce_kprobe);
         defex_enforce_hooked = false;
     }
+    ksu_trusted_task = NULL;
 #endif
 }
 

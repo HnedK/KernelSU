@@ -54,6 +54,13 @@ void apply_kernelsu_rules()
     mutex_lock(&selinux_state.policy_mutex);
 
     old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
+
+    /* No policy loaded yet; ksu_dup_sepolicy() would oops on the NULL policy. */
+    if (!old_pol) {
+        pr_warn("SELinux policy not loaded, skip KSU rule application\n");
+        goto out_unlock;
+    }
+
     backup_sepolicy = ksu_dup_sepolicy(old_pol);
     if (IS_ERR(backup_sepolicy)) {
         pr_err("failed to create backup sepolicy: %ld\n", PTR_ERR(backup_sepolicy));
