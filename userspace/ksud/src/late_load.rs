@@ -55,7 +55,22 @@ pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Re
         info!("Detected KMI: {kmi}");
 
         // 3. Get kernelsu.ko from embedded assets
-        let ko_name = format!("{kmi}_kernelsu.ko");
+        // KSUD_TREE=exynos (injected via UMH envp) selects the -exynos
+        // asset with pre-injected __versions; others keep the default one.
+        let ko_name = if std::env::var("KSUD_TREE").as_deref() == Ok("exynos") {
+            let exynos_name = format!("{kmi}-exynos_kernelsu.ko");
+            if assets::get_asset_data(&exynos_name).is_ok() {
+                exynos_name
+            } else {
+                warn!(
+                    "KSUD_TREE=exynos set but {exynos_name} asset missing; \
+                     falling back to default asset"
+                );
+                format!("{kmi}_kernelsu.ko")
+            }
+        } else {
+            format!("{kmi}_kernelsu.ko")
+        };
         let ko_data = assets::get_asset_data(&ko_name)
             .with_context(|| format!("Failed to get {ko_name} from assets"))?;
 
