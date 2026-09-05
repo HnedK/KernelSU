@@ -147,6 +147,9 @@ int __init kernelsu_init(void)
         return ret;
     }
 
+    /* Exynos targets build with CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT: text
+     * patching is compiled out, the dispatcher slot never installs, and
+     * hook_manager registers the Samsung sucompat kprobe fallback. */
     ksu_syscall_hook_init();
 
     ksu_feature_init();
