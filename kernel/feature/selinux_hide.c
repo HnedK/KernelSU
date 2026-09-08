@@ -28,6 +28,23 @@
 #include "ksu.h"
 #include "policy/feature.h"
 #include "hook/lsm_hook.h"
+#include <linux/kprobes.h>
+#include <linux/ptrace.h>
+#include <linux/workqueue.h>
+
+/*
+ * Samsung RKP (Snapdragon) / NO_PATCH_TEXT (Exynos) targets cannot rewrite the
+ * read-only selinuxfs pointer tables via ksu_patch_text: RKP marks those
+ * .rodata pages read-only at a higher exception level. Redirect through the
+ * kernel's own text-patching channels instead - kprobe for the write_op
+ * handlers, kretprobe for the status open handler. setprocattr keeps using
+ * ksu_lsm_hook, which switches to __static_call_update on these targets
+ * (see hook/lsm_hook.c). Non-Samsung targets keep the patch_text path.
+ */
+#if (defined(CONFIG_KSU_SAMSUNG_RKP) || defined(CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT)) &&                                 \
+    defined(CONFIG_KRETPROBES) && defined(__aarch64__)
+#define KSU_SELINUX_HIDE_USE_KPROBE 1
+#endif
 
 static DEFINE_MUTEX(selinux_hide_mutex);
 static bool ksu_selinux_hide_enabled __read_mostly = false;
@@ -80,7 +97,7 @@ static struct selinux_state fake_state;
 static write_op_fn *context_write, *access_write;
 static write_op_fn orig_context_write, orig_access_write;
 
-static ssize_t my_write_context(struct file *file, char *buf, size_t size)
+static ssize_t __nocfi my_write_context(struct file *file, char *buf, size_t size)
 {
     // apply to all app uids
     if (likely(current_uid().val < 10000)) {
@@ -131,7 +148,7 @@ out:
     return length;
 }
 
-static ssize_t my_write_access(struct file *file, char *buf, size_t size)
+static ssize_t __nocfi my_write_access(struct file *file, char *buf, size_t size)
 {
     // apply to all app uids
     if (likely(current_uid().val < 10000)) {
@@ -198,10 +215,78 @@ out:
     return length;
 }
 
+#ifdef KSU_SELINUX_HIDE_USE_KPROBE
+/*
+ * RKP path: redirect the selinuxfs write_op handlers at function entry rather
+ * than patching the read-only write_op table. Mirrors the Samsung sucompat
+ * kprobe redirection in hook/syscall_hook_manager.c: the pre_handler only
+ * redirects app-uid callers, and my_write_{context,access} never call the
+ * original on that branch, so the kprobe is not re-entered. The sleeping
+ * backup_sepolicy computation runs in the redirected replacement function,
+ * i.e. in the normal syscall context after the BRK exception has returned.
+ */
+static bool ksu_selinux_hide_should_redirect(void)
+{
+    return ksu_selinux_hide_enabled && current_uid().val >= 10000;
+}
+
+/*
+ * Arm a redirect kprobe on a freshly reset struct. unregister_kprobe() leaves
+ * KPROBE_FLAG_DISABLED set on the static struct, so re-registering after a
+ * feature toggle would yield an inert probe (observed as disabled=1). Reset the
+ * whole struct to a pristine state before arming.
+ */
+static int sel_hide_register_kprobe(struct kprobe *kp, kprobe_pre_handler_t handler, void *addr)
+{
+    int ret;
+    memset(kp, 0, sizeof(*kp));
+    kp->pre_handler = handler;
+    kp->addr = (kprobe_opcode_t *)addr;
+    ret = register_kprobe(kp);
+    if (ret)
+        pr_err("selinux_hide: register_kprobe %px err: %d\n", addr, ret);
+    return ret;
+}
+
+static int sel_write_context_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    if (!ksu_selinux_hide_should_redirect())
+        return 0;
+    instruction_pointer_set(regs, (unsigned long)my_write_context);
+    return 1;
+}
+
+static int sel_write_access_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    if (!ksu_selinux_hide_should_redirect())
+        return 0;
+    instruction_pointer_set(regs, (unsigned long)my_write_access);
+    return 1;
+}
+
+static struct kprobe sel_context_write_kprobe = {
+    .pre_handler = sel_write_context_pre_handler,
+};
+
+static struct kprobe sel_access_write_kprobe = {
+    .pre_handler = sel_write_access_pre_handler,
+};
+
+static bool sel_context_kprobe_registered;
+static bool sel_access_kprobe_registered;
+#endif
+
 static int my_setprocattr(const char *name, void *value, size_t size);
 struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(setprocattr, "selinux_setprocattr", my_setprocattr, 0);
 
 typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
+/*
+ * The real selinux_setprocattr, called by my_setprocattr for pass-through and
+ * valid-context cases. In the patch_text path ksu_lsm_hook() saves it into
+ * selinux_setprocattr_hook.original and we copy it here; in the RKP kprobe path
+ * we resolve it directly and it is also the kprobe target.
+ */
+static setprocattr_fn orig_setprocattr;
 static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
 {
     int error;
@@ -241,8 +326,39 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
     }
 
 call_orig:
-    return ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
+    return orig_setprocattr(name, value, size);
 }
+
+#ifdef KSU_SELINUX_HIDE_USE_KPROBE
+/*
+ * RKP path: hook selinux_setprocattr with a kprobe instead of the LSM
+ * static_call. The static_call update (lsm_hook SCALL_ONLY) does not redirect
+ * the 6.12 LSM dispatch under RKP, so my_setprocattr was never invoked and the
+ * /proc/self/attr/current probe leaked the live policy (DirtySepolicy
+ * contextExists step 3 saw EPERM -> "exists"). The kprobe redirect is the
+ * mechanism already proven to work for context/access.
+ *
+ * Reentrancy: my_setprocattr calls orig_setprocattr (= this probe's target) for
+ * pass-through and valid-context cases. That call's return address (x30) lies
+ * inside my_setprocattr; the pre_handler detects it and lets the original run,
+ * breaking the recursion. The legit caller (security_setprocattr) lives in
+ * vmlinux, far from the module text, so the range check cannot misfire on it.
+ */
+static unsigned long my_setprocattr_start, my_setprocattr_end;
+static struct kprobe sel_setprocattr_kprobe;
+static bool sel_setprocattr_kprobe_registered;
+
+static int sel_setprocattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    unsigned long ra = regs->regs[30];
+    if (ra >= my_setprocattr_start && ra < my_setprocattr_end)
+        return 0; /* recursive call from my_setprocattr -> run the original */
+    if (!ksu_selinux_hide_should_redirect())
+        return 0;
+    instruction_pointer_set(regs, (unsigned long)my_setprocattr);
+    return 1;
+}
+#endif
 
 static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
 static struct page *fake_status = NULL;
@@ -318,6 +434,77 @@ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
     return ret;
 }
 
+#ifdef KSU_SELINUX_HIDE_USE_KPROBE
+/*
+ * RKP path: serve the fake status page via a kretprobe on
+ * sel_open_handle_status instead of patching sel_handle_status_ops.open
+ * (read-only). The return handler runs in atomic context, so it only reads
+ * fake_status with READ_ONCE and writes filp->private_data - no mutex, no
+ * sleeping. fake_status transitions NULL -> page once and is cleared only at
+ * module exit, which unregisters the kretprobe (draining in-flight handlers)
+ * before __free_page, so READ_ONCE is race-free here.
+ *
+ * The lazy fake-page construction used by the non-late-load boot path sleeps
+ * (mutex + alloc_page), so it is deferred to a workqueue. schedule_work
+ * deduplicates against the same work_struct. On S26 (late_load) the
+ * fake_status_initialize_key is never enabled and this branch never fires.
+ */
+static void fake_status_init_work_fn(struct work_struct *work)
+{
+    initialize_fake_status();
+}
+static DECLARE_WORK(fake_status_init_work, fake_status_init_work_fn);
+
+static int sel_status_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    /* sel_open_handle_status(struct inode *inode, struct file *filp) */
+    *(struct file **)ri->data = (struct file *)regs->regs[1];
+    return 0;
+}
+
+static int sel_status_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct file *filp = *(struct file **)ri->data;
+    long ret = regs_return_value(regs);
+
+    /*
+     * Mirror my_sel_open_handle_status's fake branch: for an app uid with the
+     * feature enabled and a fake page built, serve fake_status and force a 0
+     * return regardless of what the original returned. Unlike the patch_text
+     * path (which skipped the original), the kretprobe lets sel_open_handle_status
+     * run first; its only side effect is filp->private_data, overwritten here.
+     */
+    if (filp && current_uid().val >= 10000 && ksu_selinux_hide_enabled) {
+        struct page *fs = READ_ONCE(fake_status);
+        if (fs) {
+            filp->private_data = fs;
+            regs_set_return_value(regs, 0);
+        }
+    }
+
+    if (static_branch_unlikely(&fake_status_initialize_key) && ret == 0 && !READ_ONCE(fake_status))
+        schedule_work(&fake_status_init_work);
+
+    return 0;
+}
+
+static struct kretprobe sel_status_open_kretprobe = {
+    .entry_handler = sel_status_entry_handler,
+    .handler = sel_status_ret_handler,
+    .data_size = sizeof(struct file *),
+};
+
+static bool sel_status_kretprobe_registered;
+
+static void unhook_selinux_status_kretprobe(void)
+{
+    if (sel_status_kretprobe_registered) {
+        unregister_kretprobe(&sel_status_open_kretprobe);
+        sel_status_kretprobe_registered = false;
+    }
+}
+#endif
+
 static void hook_selinux_status_open();
 static void ksu_selinux_hide_unhook();
 static int ksu_selinux_hide_enable()
@@ -351,29 +538,69 @@ static int ksu_selinux_hide_enable()
 
     context_write = &selinux_write_op[SEL_CONTEXT];
     pr_info("selinux_hide: context_write: 0x%lx [%pSb]\n", (unsigned long)*context_write, *context_write);
-    write_op_fn my = my_write_context;
     orig_context_write = *context_write;
+
+    access_write = &selinux_write_op[SEL_ACCESS];
+    pr_info("selinux_hide: access_write: 0x%lx [%pSb]\n", (unsigned long)*access_write, *access_write);
+    orig_access_write = *access_write;
+
+#ifdef KSU_SELINUX_HIDE_USE_KPROBE
+    ret = sel_hide_register_kprobe(&sel_context_write_kprobe, sel_write_context_pre_handler, orig_context_write);
+    if (ret) {
+        pr_err("selinux_hide: init: register_kprobe context_write err: %d\n", ret);
+        goto unhook;
+    }
+    sel_context_kprobe_registered = true;
+
+    ret = sel_hide_register_kprobe(&sel_access_write_kprobe, sel_write_access_pre_handler, orig_access_write);
+    if (ret) {
+        pr_err("selinux_hide: init: register_kprobe access_write err: %d\n", ret);
+        goto unhook;
+    }
+    sel_access_kprobe_registered = true;
+#else
+    write_op_fn my = my_write_context;
     ret = ksu_patch_text(context_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
         pr_err("selinux_hide: init: patch_text context_write err: %d\n", ret);
         goto unhook;
     }
 
-    access_write = &selinux_write_op[SEL_ACCESS];
-    pr_info("selinux_hide: access_write: 0x%lx [%pSb]\n", (unsigned long)*access_write, *access_write);
     my = my_write_access;
-    orig_access_write = *access_write;
     ret = ksu_patch_text(access_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
         pr_err("selinux_hide: init: patch_text access_write err: %d\n", ret);
         goto unhook;
     }
+#endif
 
+#ifdef KSU_SELINUX_HIDE_USE_KPROBE
+    orig_setprocattr = (setprocattr_fn)ksu_resolve_symbol_for_functable_hook("selinux_setprocattr");
+    if (!orig_setprocattr) {
+        pr_err("selinux_hide: init: selinux_setprocattr not resolved\n");
+        goto unhook;
+    }
+    my_setprocattr_start = (unsigned long)my_setprocattr;
+    {
+        unsigned long sz = 0;
+        if (!kallsyms_lookup_size_offset(my_setprocattr_start, &sz, NULL) || !sz)
+            sz = 0x800;
+        my_setprocattr_end = my_setprocattr_start + sz;
+    }
+    ret = sel_hide_register_kprobe(&sel_setprocattr_kprobe, sel_setprocattr_pre_handler, orig_setprocattr);
+    if (ret) {
+        pr_err("selinux_hide: init: register_kprobe setprocattr err: %d\n", ret);
+        goto unhook;
+    }
+    sel_setprocattr_kprobe_registered = true;
+#else
     ret = ksu_lsm_hook(&selinux_setprocattr_hook);
     if (ret) {
         pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\n", ret);
         goto unhook;
     }
+    orig_setprocattr = (setprocattr_fn)selinux_setprocattr_hook.original;
+#endif
 
     return 0;
 
@@ -384,6 +611,25 @@ unhook:
 
 static void ksu_selinux_hide_unhook()
 {
+#ifdef KSU_SELINUX_HIDE_USE_KPROBE
+    if (sel_setprocattr_kprobe_registered) {
+        unregister_kprobe(&sel_setprocattr_kprobe);
+        sel_setprocattr_kprobe_registered = false;
+    }
+    orig_setprocattr = NULL;
+    if (sel_access_kprobe_registered) {
+        unregister_kprobe(&sel_access_write_kprobe);
+        sel_access_kprobe_registered = false;
+    }
+    orig_access_write = NULL;
+    if (sel_context_kprobe_registered) {
+        unregister_kprobe(&sel_context_write_kprobe);
+        sel_context_kprobe_registered = false;
+    }
+    orig_context_write = NULL;
+    unhook_selinux_status_kretprobe();
+    orig_sel_open_handle_status = NULL;
+#else
     int ret;
     if (orig_context_write) {
         ret =
@@ -409,6 +655,8 @@ static void ksu_selinux_hide_unhook()
         }
     }
     ksu_lsm_unhook(&selinux_setprocattr_hook);
+    orig_setprocattr = NULL;
+#endif
 }
 
 static void ksu_selinux_hide_disable()
@@ -485,14 +733,33 @@ static void hook_selinux_status_open()
         }
         sel_open_handle_status_slot = &ops->open;
     }
-    sel_open_handle_status_fn new_fn = my_sel_open_handle_status;
     orig_sel_open_handle_status = *sel_open_handle_status_slot;
+#ifdef KSU_SELINUX_HIDE_USE_KPROBE
+    /* Reset before (re)arming: unregister_kretprobe() leaves KPROBE_FLAG_DISABLED
+     * set on the static struct, which would keep the probe inert after a toggle. */
+    memset(&sel_status_open_kretprobe, 0, sizeof(sel_status_open_kretprobe));
+    sel_status_open_kretprobe.entry_handler = sel_status_entry_handler;
+    sel_status_open_kretprobe.handler = sel_status_ret_handler;
+    sel_status_open_kretprobe.data_size = sizeof(struct file *);
+    sel_status_open_kretprobe.kp.addr = (kprobe_opcode_t *)orig_sel_open_handle_status;
+    int ret = register_kretprobe(&sel_status_open_kretprobe);
+    if (ret) {
+        pr_err("selinux_hide: init: register_kretprobe sel_open_handle_status err: %d\n", ret);
+        sel_open_handle_status_slot = NULL;
+        orig_sel_open_handle_status = NULL;
+        return;
+    }
+    sel_status_kretprobe_registered = true;
+    pr_info("selinux_hide: status open kretprobe registered at %pSb\n", orig_sel_open_handle_status);
+#else
+    sel_open_handle_status_fn new_fn = my_sel_open_handle_status;
     int ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
         pr_err("selinux_hide: init: patch_text sel_open_handle_status err: %d\n", ret);
         sel_open_handle_status_slot = NULL;
         orig_sel_open_handle_status = NULL;
     }
+#endif
 }
 
 void __init ksu_selinux_hide_init()
@@ -517,6 +784,17 @@ void __exit ksu_selinux_hide_exit()
     }
     mutex_unlock(&selinux_hide_mutex);
     ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
+#ifdef KSU_SELINUX_HIDE_USE_KPROBE
+    /*
+     * The status kretprobe is installed at init and stays registered even if
+     * the feature was never enabled (disable->unhook only runs when running).
+     * Unregister it here so no return handler executes module text after
+     * unload, then drain any deferred lazy-init work before freeing the page.
+     */
+    unhook_selinux_status_kretprobe();
+    cancel_work_sync(&fake_status_init_work);
+    orig_sel_open_handle_status = NULL;
+#endif
     mutex_lock(&selinux_state.status_lock);
     if (fake_status)
         __free_page(fake_status);
