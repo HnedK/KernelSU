@@ -35,13 +35,18 @@ fn dump_process_info(label: &str) {
     );
 }
 
-pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+pub fn run(
+    _package_name: &String,
+    kmi: Option<String>,
+    stage_from: String,
+    allow_shell: bool,
+) -> Result<()> {
     info!("late-load command triggered!");
     dump_process_info("late-load start");
 
     // Copy the daemon before loading the module changes this process's
     // security context. The remaining install steps require KernelSU policy.
-    utils::stage_daemon_from("/data/local/tmp/.ksud-stage").context("Failed to stage ksud")?;
+    utils::stage_daemon_from(stage_from).context("Failed to stage ksud")?;
 
     // 1. Check if KernelSU is already loaded
     if ksuinit::has_kernelsu() {

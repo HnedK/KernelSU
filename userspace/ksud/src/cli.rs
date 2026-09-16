@@ -63,6 +63,10 @@ enum Commands {
         /// manager package name
         #[arg(long, default_value_t = String::from(defs::DEFAULT_PACKAGE_NAME))]
         package_name: String,
+
+        /// Stage ksud from specified path
+        #[arg(long, default_value_t = String::from("/data/local/tmp/.ksud-stage"))]
+        stage_from: String,
     },
 
     /// Emulate system reboot
@@ -643,6 +647,7 @@ pub fn run() -> Result<()> {
             post_magica,
             kmi,
             package_name,
+            stage_from,
         } => {
             if let Some(port) = magica {
                 return crate::magica::run(port, &package_name, allow_shell).map_err(|e| {
@@ -650,7 +655,7 @@ pub fn run() -> Result<()> {
                     e
                 });
             }
-            let result = crate::late_load::run(&package_name, kmi, allow_shell);
+            let result = crate::late_load::run(&package_name, kmi, stage_from, allow_shell);
             if post_magica {
                 info!("Restoring adb properties (post-magica cleanup)...");
                 if let Err(e) = crate::magica::disable_adb_root() {
