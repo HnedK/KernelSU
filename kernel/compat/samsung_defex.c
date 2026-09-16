@@ -18,7 +18,9 @@ static defex_get_task_creds_t defex_get_task_creds;
 static defex_set_task_creds_t defex_set_task_creds;
 static bool defex_enforce_hooked;
 
-/* The module loader (ksud) is DEFEX-visible before it enters the KSU domain. */
+/* The module loader (ksud) is DEFEX-visible before it enters the KSU domain.
+ * Any root task stays exempt as well: zygisk module loading runs as root
+ * outside the KSU domain (polygraphene 91030640, credit @diabl0w). */
 static struct task_struct *ksu_trusted_task;
 
 static int ksu_samsung_defex_pre_handler(struct kprobe *probe, struct pt_regs *regs)
@@ -26,8 +28,7 @@ static int ksu_samsung_defex_pre_handler(struct kprobe *probe, struct pt_regs *r
     struct task_struct *task = (struct task_struct *)regs->regs[0];
 
     (void)probe;
-    if (task == ksu_trusted_task ||
-        (task == current && current_uid().val == 0 && is_ksu_domain()))
+    if (task == ksu_trusted_task || (task == current && current_uid().val == 0))
         regs->regs[0] = 0;
 
     return 0;
