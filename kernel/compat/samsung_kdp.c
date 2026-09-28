@@ -27,8 +27,8 @@ typedef unsigned int (*kdp_usecount_sub_and_test_t)(int nr, struct cred *cred);
 typedef unsigned int (*kdp_usecount_dec_and_test_t)(struct cred *cred);
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
-typedef long (*inc_rlimit_ucounts_t)(struct ucounts *ucounts, enum rlimit_type type, long value);
-typedef bool (*dec_rlimit_ucounts_t)(struct ucounts *ucounts, enum rlimit_type type, long value);
+typedef long (*inc_rlimit_ucounts_t)(struct ucounts *ucounts, unsigned int type, long value);
+typedef bool (*dec_rlimit_ucounts_t)(struct ucounts *ucounts, unsigned int type, long value);
 #endif
 
 struct samsung_kdp_commit_work {
@@ -52,7 +52,7 @@ static inc_rlimit_ucounts_t inc_rlimit_ucounts_fn;
 static dec_rlimit_ucounts_t dec_rlimit_ucounts_fn;
 #endif
 
-static void samsung_kdp_commit_worker(struct work_struct *work)
+static void __nocfi samsung_kdp_commit_worker(struct work_struct *work)
 {
     struct samsung_kdp_commit_work *commit_work = container_of(work, struct samsung_kdp_commit_work, work);
     struct task_struct *target = commit_work->target;
@@ -112,9 +112,9 @@ static void samsung_kdp_commit_worker(struct work_struct *work)
 out:
     complete(&commit_work->completion);
 }
-#endif
+#endif /* CONFIG_KSU_SAMSUNG_KDP */
 
-void ksu_samsung_kdp_put_cred(const struct cred *cred)
+void __nocfi ksu_samsung_kdp_put_cred(const struct cred *cred)
 {
 #ifdef CONFIG_KSU_SAMSUNG_KDP
     struct cred *mutable_cred = (struct cred *)cred;
