@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
+use prop_rs_android::sys_prop;
 use rustix::cstr;
 use std::time::Instant;
 
@@ -35,18 +36,46 @@ fn dump_process_info(label: &str) {
     );
 }
 
+fn clone_pid_environ(pid: u32) {
+    if let Ok(env_raw) = std::fs::read(format!("/proc/{pid}/environ")) {
+        env_raw
+            .split(|&b| b == 0)
+            .filter_map(|e| std::str::from_utf8(e).ok())
+            .filter_map(|s| s.split_once('='))
+            .for_each(|(k, v)| unsafe { std::env::set_var(k, v) });
+    }
+}
+
 pub fn run(
     _package_name: &String,
     kmi: Option<String>,
-    stage_from: String,
+    stage_from: &str,
     allow_shell: bool,
 ) -> Result<()> {
     info!("late-load command triggered!");
     dump_process_info("late-load start");
 
-    // Copy the daemon before loading the module changes this process's
-    // security context. The remaining install steps require KernelSU policy.
-    utils::stage_daemon_from(stage_from).context("Failed to stage ksud")?;
+    // Start with a basic init environ: a late-load inherits whatever the
+    // caller had (the blob chain passes a bare modprobe context), and every
+    // child we spawn below inherits it from us.
+    clone_pid_environ(1);
+
+    // Two install routes, picked by whether the caller pre-staged a daemon:
+    //
+    // - Stage file present (boot-time flows and su_daemon-style chains write
+    //   /data/local/tmp/.ksud-stage themselves): copy it to /data/adb/ksud
+    //   *before* the module load, while this process still runs under the
+    //   vendor domain. The remaining install steps require KernelSU policy
+    //   and run after the load (see finish_install below).
+    // - Stage file absent (callers that just exec `ksud late-load`, e.g. the
+    //   DirtyFrag blob): keep upstream's flow -- load first, then the running
+    //   binary installs itself to /data/adb/ksud under KernelSU's policy.
+    let staged = std::path::Path::new(stage_from).exists();
+    if staged {
+        utils::stage_daemon_from(stage_from).context("Failed to stage ksud")?;
+    } else {
+        info!("no staged daemon at {stage_from}; installing self after module load");
+    }
 
     // 1. Check if KernelSU is already loaded
     if ksuinit::has_kernelsu() {
@@ -92,9 +121,58 @@ pub fn run(
         dump_process_info("after load_module");
     }
 
+    // Say what the module actually reports, now that it is in. Everything
+    // below can fail without KernelSU being at fault, and the caller's
+    // descriptors stop working the moment the sepolicy is reloaded, so this
+    // is the one line that says "it is loaded and answering" somewhere that
+    // survives.
+    {
+        let info = crate::ksucalls::get_info();
+        info!(
+            "KernelSU live: version={} uapi={} flags=0x{:x} features=0x{:x} late_load={}",
+            crate::ksucalls::get_version(),
+            info.uapi_version,
+            info.flags,
+            info.features,
+            crate::ksucalls::is_late_load()
+        );
+    }
+
+    // Rejoin init's mount namespace before touching modules.
+    //
+    // A late-load is exec'd from a throwaway private namespace: the caller has
+    // to unshare(CLONE_NEWNS) to bind-mount this binary over a path it is
+    // allowed to exec, and marks / as MS_REC|MS_PRIVATE so that cover does not
+    // escape. Everything below -- the metamodule mount, and every module
+    // script, which inherits this namespace -- would then run against mounts
+    // that die with this process, while the daemons those scripts start keep
+    // running and expect them. At boot ksud is already in init's namespace and
+    // none of this arises; rejoining reproduces that.
+    if let Err(e) = utils::switch_mnt_ns(1) {
+        warn!("failed to rejoin init mount namespace: {e}");
+    }
+
     // We need to reset stdin/stdout/stderr; otherwise, sending file descriptors via cmd transactions
-    // will be blocked by SELinux because its fsec->sid is still u:r:su:s0 instead of u:r:ksu:s0.
+    // will be blocked by SELinux because its fsec->sid is still u:r:vendor_modprobe:s0 instead of u:r:ksu:s0.
     utils::reset_std()?;
+
+    // Upgrade to a full android environ so that modules can be properly loaded
+    if sys_prop::init().is_err() {
+        warn!("could not init sys_prop, skipping zygote env clone");
+    } else if let Some(pid) =
+        sys_prop::get("init.svc_debug_pid.zygote").and_then(|val| val.parse::<u32>().ok())
+    {
+        clone_pid_environ(pid);
+        info!("cloned env from zygote pid={pid}");
+    }
+
+    // Append KSU binary dir to PATH
+    let mut paths: Vec<_> =
+        std::env::var_os("PATH").map_or_else(Vec::new, |v| std::env::split_paths(&v).collect());
+    paths.push(defs::BINARY_DIR.trim_end_matches('/').into());
+    if let Ok(new_path) = std::env::join_paths(paths) {
+        unsafe { std::env::set_var("PATH", new_path) };
+    }
 
     utils::umask(0);
 
@@ -102,11 +180,19 @@ pub fn run(
         warn!("clear temp configs failed: {e}");
     }
 
-    // The daemon was already staged by stage_daemon_from() before the module
-    // load. finish_install() must NOT rewrite /data/adb/ksud: after the module
-    // changed this process's security context, writing the daemon path fails
-    // under Samsung KDP/SELinux and leaves a zero-byte file.
-    utils::finish_install(None).context("Failed to finish ksud installation")?;
+    // Install route, part two (see the top of run()):
+    // - staged: the daemon file is already in place; finish_install() only
+    //   runs the remaining steps and must NOT rewrite /data/adb/ksud. After
+    //   the module changed this process's security context, writing the
+    //   daemon path fails under Samsung KDP/SELinux and leaves a zero-byte
+    //   file -- which is exactly why this split exists.
+    // - unstaged: upstream's late-load install() -- copy /proc/self/exe to
+    //   /data/adb/ksud now that the process runs under KernelSU's policy.
+    if staged {
+        utils::finish_install(None).context("Failed to finish ksud installation")?;
+    } else {
+        utils::install(None, None).context("Failed to install ksud")?;
+    }
 
     // 5. Handle module updates
     if let Err(e) = handle_updated_modules() {
@@ -135,9 +221,31 @@ pub fn run(
         warn!("init features failed: {e}");
     }
 
-    // 8. Execute late-load stage scripts with a shared boot deadline
+    // 8. Execute late-load stage scripts (blocking)
+    //
+    // Module stage scripts assume the environment a boot gives them: their
+    // module mounts already established, and no framework running yet. A
+    // late-load can offer neither. What they do instead is start daemons --
+    // a Zygisk implementation, LSPosed's lspd, Sui -- against a zygote that
+    // is already serving, and those daemons restart it to inject. On warhol
+    // that reliably kills system_server: it comes back up and dies in
+    // ApplicationSharedMemory.nativeCreate with ENOENT, every time, until
+    // the device is rebooted.
+    //
+    // So they are off unless asked for. KernelSU itself -- su, the manager,
+    // the allowlist -- needs none of this; only modules do, and a module
+    // that a late-load cannot mount is not one this should be starting.
+    let run_module_scripts = std::env::var("KSU_LATE_LOAD_MODULES")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if !run_module_scripts {
+        warn!("late-load: skipping module stage scripts (set KSU_LATE_LOAD_MODULES=1 to run them)");
+    }
+
+    // Both blocking stages share one boot deadline.
     let wait = ScriptWait::Until(Instant::now() + defs::BOOT_STAGE_TIMEOUT);
-    init_event::run_stage("late-load", wait);
+    if run_module_scripts {
+        init_event::run_stage("late-load", wait);
+    }
 
     // 9. Load system.prop
     if let Err(e) = crate::module::load_system_prop() {
@@ -150,13 +258,19 @@ pub fn run(
     }
 
     // 11. Execute post-mount stage scripts using the same deadline
-    init_event::run_stage("post-mount", wait);
+    if run_module_scripts {
+        init_event::run_stage("post-mount", wait);
+    }
 
     // 12. Execute service stage scripts (non-blocking)
-    init_event::run_stage("service", ScriptWait::NoWait);
+    if run_module_scripts {
+        init_event::run_stage("service", ScriptWait::NoWait);
+    }
 
     // 13. Execute boot-completed stage scripts (non-blocking)
-    init_event::run_stage("boot-completed", ScriptWait::NoWait);
+    if run_module_scripts {
+        init_event::run_stage("boot-completed", ScriptWait::NoWait);
+    }
 
     Ok(())
 }

@@ -655,7 +655,7 @@ pub fn run() -> Result<()> {
                     e
                 });
             }
-            let result = crate::late_load::run(&package_name, kmi, stage_from, allow_shell);
+            let result = crate::late_load::run(&package_name, kmi, &stage_from, allow_shell);
             if post_magica {
                 info!("Restoring adb properties (post-magica cleanup)...");
                 if let Err(e) = crate::magica::disable_adb_root() {
