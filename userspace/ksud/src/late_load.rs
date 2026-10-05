@@ -51,6 +51,7 @@ pub fn run(
     kmi: Option<String>,
     stage_from: &str,
     allow_shell: bool,
+    soft_reboot: bool,
 ) -> Result<()> {
     info!("late-load command triggered!");
     dump_process_info("late-load start");
@@ -260,6 +261,13 @@ pub fn run(
     // 11. Execute post-mount stage scripts using the same deadline
     if run_module_scripts {
         init_event::run_stage("post-mount", wait);
+    }
+
+    if soft_reboot {
+        // soft_reboot runs stop → post-fs-data → start → service → boot-completed internally,
+        // so skip the inline service/boot-completed stages to avoid double execution.
+        info!("Triggering soft-reboot...");
+        return crate::soft_reboot::soft_reboot();
     }
 
     // 12. Execute service stage scripts (non-blocking)

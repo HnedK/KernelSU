@@ -247,6 +247,53 @@ pub fn stage_daemon_from(staged_exe: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+pub fn set_partitions_ro() -> i32 {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::io::AsRawFd;
+
+    const PARTITIONS: &[&str] = &[
+        "boot",
+        "dtbo",
+        "init_boot",
+        "vendor_boot",
+        "super",
+        "optics",
+        "prism",
+        "vbmeta",
+    ];
+    const BLKROSET: libc::c_int = 0x125d;
+
+    let mut count = 0i32;
+
+    for base in PARTITIONS {
+        for suffix in ["", "_a", "_b"] {
+            let path = format!("/dev/block/by-name/{base}{suffix}");
+
+            let std::result::Result::Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
+
+            match file.metadata() {
+                std::result::Result::Ok(m) if m.file_type().is_block_device() => {}
+                _ => continue,
+            }
+
+            let on: libc::c_int = 1;
+            let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKROSET, &on) };
+            if ret == 0 {
+                count += 1;
+            } else {
+                log::warn!(
+                    "set_partitions_ro: BLKROSET failed for {path}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    count
+}
+
 /// Finish the remaining install steps without rewriting DAEMON_PATH.
 ///
 /// Samsung late-load: the daemon is already staged (see `stage_daemon_from`)

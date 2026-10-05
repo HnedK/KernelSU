@@ -67,6 +67,14 @@ enum Commands {
         /// Stage ksud from specified path
         #[arg(long, default_value_t = String::from("/data/local/tmp/.ksud-stage"))]
         stage_from: String,
+
+        /// Trigger soft-reboot after late-load completes instead of running service/boot-completed inline
+        #[arg(long)]
+        soft_reboot: bool,
+
+        /// Set kernel/bootloader partitions read-only after late-load completes
+        #[arg(long)]
+        ro_partitions: bool,
     },
 
     /// Emulate system reboot
@@ -648,19 +656,32 @@ pub fn run() -> Result<()> {
             kmi,
             package_name,
             stage_from,
+            soft_reboot,
+            ro_partitions,
         } => {
+            // DirtyFrag/standalone chains exec `ksud late-load` without extra argv and pass
+            // allow_shell via the ALLOW_SHELL env baked into the s2 shellcode slot; merge it
+            // here so the env takes effect in addition to `--allow-shell`.
+            let allow_shell = allow_shell
+                || std::env::var("ALLOW_SHELL")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
             if let Some(port) = magica {
                 return crate::magica::run(port, &package_name, allow_shell).map_err(|e| {
                     error!("Error running magica: {e}");
                     e
                 });
             }
-            let result = crate::late_load::run(&package_name, kmi, &stage_from, allow_shell);
+            let result =
+                crate::late_load::run(&package_name, kmi, &stage_from, allow_shell, soft_reboot);
             if post_magica {
                 info!("Restoring adb properties (post-magica cleanup)...");
                 if let Err(e) = crate::magica::disable_adb_root() {
                     error!("disable adb root failed: {e}");
                 }
+            }
+            if ro_partitions {
+                let count = utils::set_partitions_ro();
+                info!("set {count} partition(s) read-only");
             }
             result
         }
