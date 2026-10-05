@@ -139,6 +139,17 @@ fn reset_boot_completed() -> Result<()> {
     Ok(())
 }
 
+fn set_rescue_party_boot_reason() -> Result<()> {
+    // ksu's emulated reboots occasionally get escalated by rescue party into a
+    // hard reboot; announcing a warm reboot is what keeps it from escalating.
+    sys_prop::init().context("Failed to initialize system property API")?;
+    let rp = resetprop();
+    rp.set("sys.boot.reason", "reboot,rescueparty_warm_reboot")
+        .context("Failed to set sys.boot.reason")?;
+    info!("set sys.boot.reason to reboot,rescueparty_warm_reboot");
+    Ok(())
+}
+
 fn wait_for_boot_completed() -> Result<()> {
     sys_prop::init().context("Failed to initialize system property API")?;
     let rp = resetprop();
@@ -202,8 +213,23 @@ pub fn soft_reboot() -> Result<()> {
     }
     terminate_waitsys(&mut waitsys);
 
+    // The framework is down; whatever still holds a module directory is a daemon
+    // the last cycle's stage scripts left behind, and the scripts are about to
+    // run again.
+    crate::module::kill_leftover_daemons();
+
     info!("post-fs-data");
-    on_post_fs_data()?;
+    // The framework is already down: a failure here must not skip `start`.
+    // Left half-stopped, the device is turned into a real reboot by the
+    // watchdog (or the user), and on a late-load device that loses root.
+    let post_fs = on_post_fs_data();
+    if let Err(ref e) = post_fs {
+        warn!("post-fs-data failed: {e:#} (continuing to start)");
+    }
+    // Best-effort: a failure to set the prop must not stop `start`.
+    if let Err(e) = set_rescue_party_boot_reason() {
+        warn!("failed to set rescue party boot reason: {e:#}");
+    }
     info!("start");
     let status = Command::new("start").status().context("start failed")?;
     if !status.success() {
@@ -215,6 +241,10 @@ pub fn soft_reboot() -> Result<()> {
         warn!("wait for boot completed failed: {e}");
     }
     on_boot_completed();
+
+    // The reboot cycle itself is done; surface a post-fs-data failure now
+    // instead of having skipped the recovery.
+    post_fs?;
 
     unsafe {
         _exit(0);
