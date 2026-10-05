@@ -50,8 +50,9 @@ int ksu_samsung_defex_init(void)
     defex_get_task_creds = (defex_get_task_creds_t)ksu_resolve_symbol_for_functable_hook("get_task_creds");
     defex_set_task_creds = (defex_set_task_creds_t)ksu_resolve_symbol_for_functable_hook("set_task_creds");
     if (!defex_get_task_creds || !defex_set_task_creds) {
-        pr_err("Samsung DEFEX credential functions unavailable\n");
-        return -ENOENT;
+        pr_warn("Samsung DEFEX credential functions unavailable - cred sync disabled\n");
+        defex_get_task_creds = NULL;
+        defex_set_task_creds = NULL;
     }
 
     ret = register_kprobe(&defex_enforce_kprobe);
@@ -86,6 +87,9 @@ void ksu_samsung_defex_sync_current(void)
     unsigned int stored_egid;
     unsigned short cred_flags;
     int ret;
+
+    if (!defex_get_task_creds || !defex_set_task_creds)
+        return;
 
     defex_get_task_creds(current, &stored_uid, &stored_fsuid, &stored_egid, &cred_flags);
 
