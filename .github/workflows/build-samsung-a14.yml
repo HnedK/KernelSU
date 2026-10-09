@@ -3,6 +3,11 @@ name: Build KernelSU & ksud for Samsung A14 5G (A146P / A146U)
 on:
   workflow_dispatch:
     inputs:
+      source_branch:
+        description: 'Branch to checkout & build'
+        required: true
+        default: 'samsung'
+        type: string
       kmi:
         description: 'Target KMI version'
         required: true
@@ -46,6 +51,8 @@ jobs:
     steps:
       - name: Checkout KernelSU source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_branch }}
 
       - name: Patch DDK Kconfig & Build kernelsu.ko
         run: |
@@ -120,6 +127,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_branch }}
           fetch-depth: 0
 
       - name: Download compiled kernelsu.ko
