@@ -1,0 +1,165 @@
+name: Build KernelSU & ksud for Samsung A14 5G (A146P / A146U)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmi:
+        description: 'Target KMI version'
+        required: true
+        type: choice
+        options:
+          - android15-6.6
+          - android14-6.1
+          - android13-5.15
+        default: android15-6.6
+      ddk_release:
+        description: 'DDK release tag'
+        required: false
+        default: '20260828'
+        type: string
+      custom_uts:
+        description: 'Custom UTS_RELEASE (Exact output of "uname -r", e.g. 6.6.50-android15-8-abA146P... Leave empty to keep DDK default)'
+        required: false
+        default: ''
+        type: string
+      disable_scs:
+        description: 'Disable CONFIG_SHADOW_CALL_STACK (Mandatory for Samsung stock kernel)'
+        type: boolean
+        default: true
+      disable_cfi:
+        description: 'Disable CONFIG_CFI_CLANG (Mandatory for Samsung stock kernel)'
+        type: boolean
+        default: true
+      build_ksud:
+        description: 'Also compile ksud (embeds the built kernelsu.ko)'
+        type: boolean
+        default: true
+
+jobs:
+  build-kernel-module:
+    name: Build kernelsu.ko (${{ inputs.kmi }})
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+      options: --privileged
+
+    steps:
+      - name: Checkout KernelSU source
+        uses: actions/checkout@v7
+
+      - name: Patch DDK Kconfig & Build kernelsu.ko
+        run: |
+          git config --global --add safe.directory /__w/KernelSU/KernelSU
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          KDIR="/opt/ddk/src/${{ inputs.kmi }}"
+          echo "Using KDIR=$KDIR"
+
+          if [ "${{ inputs.disable_scs }}" = "true" ]; then
+            echo "--> Disabling CONFIG_SHADOW_CALL_STACK..."
+            if [ -f "$KDIR/include/generated/autoconf.h" ]; then
+              sed -i 's@^#define CONFIG_SHADOW_CALL_STACK 1@/* disabled: a14xm SCS=n */@' "$KDIR/include/generated/autoconf.h"
+            fi
+            if [ -f "$KDIR/include/config/auto.conf" ]; then
+              sed -i 's@^CONFIG_SHADOW_CALL_STACK=y$@# disabled for a14xm@' "$KDIR/include/config/auto.conf"
+            fi
+          fi
+
+          if [ "${{ inputs.disable_cfi }}" = "true" ]; then
+            echo "--> Disabling CONFIG_CFI_CLANG..."
+            if [ -f "$KDIR/include/generated/autoconf.h" ]; then
+              sed -i 's@^#define CONFIG_CFI_CLANG 1@/* disabled: a14xm CFI=n */@' "$KDIR/include/generated/autoconf.h"
+            fi
+            if [ -f "$KDIR/include/config/auto.conf" ]; then
+              sed -i 's@^CONFIG_CFI_CLANG=y$@# disabled for a14xm@' "$KDIR/include/config/auto.conf"
+            fi
+          fi
+
+          if [ -n "${{ inputs.custom_uts }}" ]; then
+            echo "--> Overriding UTS_RELEASE to '${{ inputs.custom_uts }}'..."
+            if [ -f "$KDIR/include/generated/utsrelease.h" ]; then
+              sed -i 's@^#define UTS_RELEASE .*@#define UTS_RELEASE "${{ inputs.custom_uts }}"@' "$KDIR/include/generated/utsrelease.h"
+            fi
+          fi
+
+          cd kernel
+          echo "--> Compiling kernelsu.ko with Samsung support..."
+          CONFIG_KSU=m \
+          CONFIG_KSU_SAMSUNG_KDP=y \
+          CONFIG_KSU_SAMSUNG_DEFEX=y \
+          CONFIG_KSU_RKP_NO_PATCH_TEXT=y \
+          CC=clang make
+
+          echo "--> Stripping debug symbols..."
+          llvm-strip -d kernelsu.ko
+
+          echo "--> Sanity check: KCFI brk traps count (must be 0):"
+          BRK_COUNT=$(llvm-objdump -d kernelsu.ko | grep -cE 'brk.*#0x822' || true)
+          echo "Found $BRK_COUNT brk CFI traps"
+          if [ "$BRK_COUNT" -ne 0 ] && [ "${{ inputs.disable_cfi }}" = "true" ]; then
+            echo "WARNING: CFI brk instructions detected despite CFI=n!"
+          fi
+
+          mkdir -p /github/workspace/out/aarch64
+          cp kernelsu.ko "/github/workspace/out/aarch64/${{ inputs.kmi }}_kernelsu.ko"
+          ls -lh "/github/workspace/out/aarch64/${{ inputs.kmi }}_kernelsu.ko"
+
+      - name: Upload kernelsu.ko Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: aarch64-${{ inputs.kmi }}-lkm
+          path: /github/workspace/out/aarch64/${{ inputs.kmi }}_kernelsu.ko
+
+  build-ksud:
+    name: Build ksud (with embedded module)
+    needs: build-kernel-module
+    if: ${{ inputs.build_ksud }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download compiled kernelsu.ko
+        uses: actions/download-artifact@v8
+        with:
+          name: aarch64-${{ inputs.kmi }}-lkm
+          path: ./userspace/ksud/bin/aarch64/
+
+      - name: Verify embedded LKM
+        run: |
+          ls -la ./userspace/ksud/bin/aarch64/
+          file ./userspace/ksud/bin/aarch64/*_kernelsu.ko
+
+      - name: Setup Rust
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: userspace/ksud
+          cache-targets: false
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build ksud (aarch64)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo build --target "$TRIPLE" --release --manifest-path ./userspace/ksud/Cargo.toml
+          mkdir -p ./out-ksud
+          cp target/aarch64-linux-android/release/ksud ./out-ksud/ksud-a14xm
+
+      - name: Upload ksud Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-samsung-a14
+          path: ./out-ksud/ksud-a14xm
