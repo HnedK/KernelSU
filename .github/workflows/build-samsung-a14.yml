@@ -59,34 +59,39 @@ jobs:
           git config --global --add safe.directory /__w/KernelSU/KernelSU
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-          KDIR="/opt/ddk/src/${{ inputs.kmi }}"
-          echo "Using KDIR=$KDIR"
+          echo "Container original KDIR: '$KDIR'"
+          if [ -z "$KDIR" ] || [ ! -f "$KDIR/include/config/auto.conf" ]; then
+            for cand in "/opt/ddk/kdir/${{ inputs.kmi }}" "/opt/ddk/kdir" "/opt/ddk/${{ inputs.kmi }}"; do
+              if [ -f "$cand/include/config/auto.conf" ]; then
+                KDIR="$cand"
+                break
+              fi
+            done
+            if [ ! -f "$KDIR/include/config/auto.conf" ]; then
+              FOUND_CONF=$(find /opt/ddk -name "auto.conf" 2>/dev/null | head -n 1)
+              if [ -n "$FOUND_CONF" ]; then
+                KDIR=$(dirname $(dirname $(dirname "$FOUND_CONF")))
+              fi
+            fi
+          fi
+          echo "Using verified KDIR=$KDIR"
+          export KDIR
 
           if [ "${{ inputs.disable_scs }}" = "true" ]; then
             echo "--> Disabling CONFIG_SHADOW_CALL_STACK..."
-            if [ -f "$KDIR/include/generated/autoconf.h" ]; then
-              sed -i 's@^#define CONFIG_SHADOW_CALL_STACK 1@/* disabled: a14xm SCS=n */@' "$KDIR/include/generated/autoconf.h"
-            fi
-            if [ -f "$KDIR/include/config/auto.conf" ]; then
-              sed -i 's@^CONFIG_SHADOW_CALL_STACK=y$@# disabled for a14xm@' "$KDIR/include/config/auto.conf"
-            fi
+            find "$KDIR" -name "autoconf.h" -exec sed -i 's@^#define CONFIG_SHADOW_CALL_STACK 1@/* disabled: a14xm SCS=n */@' {} +
+            find "$KDIR" -name "auto.conf" -exec sed -i 's@^CONFIG_SHADOW_CALL_STACK=y$@# disabled for a14xm@' {} +
           fi
 
           if [ "${{ inputs.disable_cfi }}" = "true" ]; then
             echo "--> Disabling CONFIG_CFI_CLANG..."
-            if [ -f "$KDIR/include/generated/autoconf.h" ]; then
-              sed -i 's@^#define CONFIG_CFI_CLANG 1@/* disabled: a14xm CFI=n */@' "$KDIR/include/generated/autoconf.h"
-            fi
-            if [ -f "$KDIR/include/config/auto.conf" ]; then
-              sed -i 's@^CONFIG_CFI_CLANG=y$@# disabled for a14xm@' "$KDIR/include/config/auto.conf"
-            fi
+            find "$KDIR" -name "autoconf.h" -exec sed -i 's@^#define CONFIG_CFI_CLANG 1@/* disabled: a14xm CFI=n */@' {} +
+            find "$KDIR" -name "auto.conf" -exec sed -i 's@^CONFIG_CFI_CLANG=y$@# disabled for a14xm@' {} +
           fi
 
           if [ -n "${{ inputs.custom_uts }}" ]; then
             echo "--> Overriding UTS_RELEASE to '${{ inputs.custom_uts }}'..."
-            if [ -f "$KDIR/include/generated/utsrelease.h" ]; then
-              sed -i 's@^#define UTS_RELEASE .*@#define UTS_RELEASE "${{ inputs.custom_uts }}"@' "$KDIR/include/generated/utsrelease.h"
-            fi
+            find "$KDIR" -name "utsrelease.h" -exec sed -i 's@^#define UTS_RELEASE .*@#define UTS_RELEASE "${{ inputs.custom_uts }}"@' {} +
           fi
 
           cd kernel
