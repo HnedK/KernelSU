@@ -274,8 +274,6 @@ clean:
     return v2_signing_valid;
 }
 
-#ifdef CONFIG_KSU_DEBUG
-
 int ksu_debug_manager_appid = -1;
 
 #include "manager/manager_identity.h"
@@ -294,8 +292,6 @@ static struct kernel_param_ops expected_size_ops = {
 };
 
 module_param_cb(ksu_debug_manager_appid, &expected_size_ops, &ksu_debug_manager_appid, S_IRUSR | S_IWUSR);
-
-#endif
 
 int get_pkg_from_apk_path(char *pkg, const char *path)
 {
@@ -338,14 +334,14 @@ int get_pkg_from_apk_path(char *pkg, const char *path)
 
 bool is_manager_apk(char *path)
 {
-#ifdef KSU_MANAGER_PACKAGE
     char pkg[KSU_MAX_PACKAGE_NAME];
-    if (get_pkg_from_apk_path(pkg, path) < 0) {
-        pr_err("Failed to get package name from apk path: %s\n", path);
-        return false;
+    if (get_pkg_from_apk_path(pkg, path) == 0) {
+        if (!strcmp(pkg, "me.weishu.kernelsu")) {
+            pr_info("is_manager_apk: matched package '%s' at '%s'\n", pkg, path);
+            return true;
+        }
     }
-
-    // pkg is `<real package>`
+#ifdef KSU_MANAGER_PACKAGE
     if (strncmp(pkg, KSU_MANAGER_PACKAGE, sizeof(KSU_MANAGER_PACKAGE))) {
         return false;
     }
