@@ -10,8 +10,7 @@
 // 3: scoped su-session driver fd
 // 4: add KSU_GET_INFO_FLAG_BUNDLED
 // 5: add EVENT_SERVICES with a start/skip result
-// TEMP (samsung): pinned to 2 to pair with the official v3.3.0 Manager (uapi 2).
-static const __u32 KERNEL_SU_UAPI_VERSION = 2;
+static const __u32 KERNEL_SU_UAPI_VERSION = 5;
 
 /* Magic numbers for reboot hook to install fd */
 static const __u32 KSU_INSTALL_MAGIC1 = 0xDEADBEEF;
