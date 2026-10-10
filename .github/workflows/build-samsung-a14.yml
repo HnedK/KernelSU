@@ -13,6 +13,7 @@ on:
         required: true
         type: choice
         options:
+          - android16-6.12
           - android15-6.6
           - android14-6.1
           - android13-5.15
