@@ -191,8 +191,8 @@ int __init kernelsu_init(void)
         track_throne(false);
 
         if (!getenforce()) {
-            pr_info("Permissive SELinux, enforcing\n");
-            setenforce(true);
+            pr_info("Permissive SELinux, keeping permissive for Samsung Knox compatibility\n");
+            // setenforce(true);
         }
 
     } else {
