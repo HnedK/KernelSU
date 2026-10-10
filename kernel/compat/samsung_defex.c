@@ -25,13 +25,8 @@ static struct task_struct *ksu_trusted_task;
 
 static int ksu_samsung_defex_pre_handler(struct kprobe *probe, struct pt_regs *regs)
 {
-    struct task_struct *task = (struct task_struct *)regs->regs[0];
-
     (void)probe;
-    // Do not corrupt regs[0] with NULL, dfroot already neutered DEFEX
-    // if (task == ksu_trusted_task || (task == current && current_uid().val == 0))
-    //     regs->regs[0] = 0;
-
+    (void)regs;
     return 0;
 }
 
