@@ -209,7 +209,8 @@ int __init kernelsu_init(void)
 
 #ifdef MODULE
 #ifndef CONFIG_KSU_DEBUG
-    kobject_del(&THIS_MODULE->mkobj.kobj);
+    // Disabled kobject_del: causes null ptr deref panic in kernel module loader on 6.12
+    // kobject_del(&THIS_MODULE->mkobj.kobj);
 #endif
 #endif
     return 0;
