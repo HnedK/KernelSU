@@ -241,7 +241,7 @@ void escape_to_root_for_init(void)
     }
 
     setup_selinux(KERNEL_SU_CONTEXT, cred);
-    commit_creds(cred);
+    ksu_samsung_kdp_commit_creds(cred);
     ksu_samsung_defex_sync_current();
 }
 
